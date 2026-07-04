@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-TLS Audit Tool v0.1
+TLS Audit Tool v0.2
 Tek bir domain için TLS/HTTPS güvenlik denetimi yapar.
 
 Kontroller:
   - TLS versiyonu
   - Cipher suite
   - Sertifika bilgileri ve son kullanma tarihi
-  - HTTP güvenlik başlıkları (headers)
+  - HTTP güvenlik başlıkları (headers) — v0.2: `requests` ile tespit,
+    eksik kritik başlıklar "uyarı" olarak işaretlenir
+
+Gereksinim:
+  pip install requests   (yalnızca header taraması için)
 
 Kullanım:
   python3 tls_audit.py --domain example.com
@@ -18,7 +22,6 @@ import ssl
 import socket
 import argparse
 import json
-import sys
 from datetime import datetime, timezone
 
 # ── Renkli terminal çıktısı ──────────────────────────────────────
@@ -58,7 +61,11 @@ def check_tls(domain, port=443):
         "cipher_bits": None,
         "certificate": {},
         "cert_days_left": None,
-        "headers": {},
+        "headers": {},           # v0.2: her başlık için {present, value, status, ...}
+        "header_warnings": [],   # v0.2: eksik kritik başlıkların listesi
+        "header_error": None,    # v0.2: header taramasında oluşan hata (varsa)
+        "final_url": None,       # v0.2: yönlendirmeler sonrası ulaşılan URL
+        "http_status": None,     # v0.2: HTTP yanıt kodu
         "errors": []
     }
 
@@ -118,58 +125,100 @@ def check_tls(domain, port=443):
 
 
 # ── HTTP Güvenlik Başlıkları ──────────────────────────────────────
-def check_headers(domain):
+# İncelenen güvenlik başlıkları ve kısa açıklamaları.
+SECURITY_HEADERS = {
+    "Strict-Transport-Security": "HSTS — tarayıcıyı yalnızca HTTPS kullanmaya zorlar",
+    "Content-Security-Policy":   "CSP — XSS ve veri enjeksiyonuna karşı kaynak kısıtlaması",
+    "X-Frame-Options":           "Clickjacking (iframe) koruması",
+    "X-Content-Type-Options":    "MIME type sniffing koruması",
+    "X-XSS-Protection":          "Eski tarayıcılarda XSS filtresi (modern tarayıcıda CSP tercih edilir)",
+    "Referrer-Policy":           "Referrer bilgisinin paylaşım politikası",
+    "Permissions-Policy":        "Tarayıcı API erişim kısıtlaması (kamera, mikrofon, konum)",
+}
+
+# Eksikliği "uyarı" sayılan kritik başlıklar (v0.2 görev kapsamı):
+# HSTS, CSP, X-Frame-Options, X-Content-Type-Options
+CRITICAL_HEADERS = {
+    "Strict-Transport-Security",
+    "Content-Security-Policy",
+    "X-Frame-Options",
+    "X-Content-Type-Options",
+}
+
+
+def check_headers(domain, port=443):
     """
-    HTTPS üzerinden HTTP güvenlik başlıklarını kontrol eder.
+    HTTPS üzerinden HTTP güvenlik başlıklarını çeker ve değerlendirir. (v0.2)
 
-    http.client kullanıyoruz (requests yerine) çünkü:
-    - Python standart kütüphanesinde — ekstra kurulum gerektirmez
-    - Sadece header'lara bakıyoruz, sayfa içeriğiyle işimiz yok
-    - Hafif ve hızlı
+    v0.1'de http.client kullanılıyordu; v0.2 ile `requests` kütüphanesine geçildi:
+    - Yönlendirmeleri (301/302) otomatik takip eder → son yanıtın başlıklarını okur
+    - Başlık erişimi büyük/küçük harfe duyarsız (CaseInsensitiveDict)
+    - Zaman aşımı, SSL ve bağlantı hatalarını tek çatı altında yönetir
 
-    Kontrol edilen başlıklar:
-    - Strict-Transport-Security (HSTS): Tarayıcıya "bu siteye sadece HTTPS ile bağlan" der
-    - X-Content-Type-Options: MIME type sniffing saldırısını engeller
-    - X-Frame-Options: Clickjacking saldırısını engeller (iframe'de gösterimi kısıtlar)
-    - Content-Security-Policy (CSP): Hangi kaynakların yüklenebileceğini belirler (XSS koruması)
-    - X-XSS-Protection: Eski tarayıcılarda XSS filtresi (modern tarayıcılarda CSP tercih edilir)
-    - Referrer-Policy: Sayfa geçişlerinde referrer bilgisinin ne kadar paylaşılacağını kontrol eder
-    - Permissions-Policy: Tarayıcı API'lerine (kamera, mikrofon, konum) erişimi kısıtlar
+    Her başlık için sonuç:
+      present : başlık yanıtta var mı (bool)
+      value   : başlığın değeri (yoksa None)
+      status  : "ok"    → başlık mevcut
+                "uyarı" → kritik başlık eksik (HSTS/CSP/X-Frame-Options/X-Content-Type-Options)
+                "eksik" → kritik olmayan başlık eksik (bilgi amaçlı)
+
+    Dönüş: mevcut JSON raporuna entegre edilmek üzere yapılandırılmış dict.
     """
-    import http.client
+    import requests
 
-    # Kontrol edilecek güvenlik başlıkları
-    security_headers = [
-        "Strict-Transport-Security",
-        "X-Content-Type-Options",
-        "X-Frame-Options",
-        "Content-Security-Policy",
-        "X-XSS-Protection",
-        "Referrer-Policy",
-        "Permissions-Policy",
-    ]
-
-    headers_result = {}
+    out = {
+        "headers": {},        # başlık adı -> değerlendirme dict'i
+        "warnings": [],       # eksik kritik başlıkların adları
+        "final_url": None,    # yönlendirmeler sonrası nihai URL
+        "http_status": None,  # HTTP yanıt kodu
+        "error": None,        # tarama sırasında oluşan hata mesajı
+    }
 
     try:
-        # HTTPS bağlantısı kur ve HEAD isteği gönder
-        # HEAD = sadece başlıkları getir, sayfa içeriğini indirme
-        conn = http.client.HTTPSConnection(domain, timeout=10)
-        conn.request("HEAD", "/")
-        response = conn.getresponse()
+        # 443 dışında bir port verilmişse URL'ye ekle
+        base = f"https://{domain}" if port == 443 else f"https://{domain}:{port}"
+        # GET + allow_redirects → yönlendirme yapan siteler için nihai başlıkları alırız.
+        resp = requests.get(
+            f"{base}/",
+            timeout=10,
+            allow_redirects=True,
+            headers={"User-Agent": "TLS-Audit-Tool/0.2"},
+        )
+        out["final_url"] = resp.url
+        out["http_status"] = resp.status_code
 
-        # Her güvenlik başlığını kontrol et
-        for header in security_headers:
-            value = response.getheader(header)
-            headers_result[header] = value if value else None
+        # Her güvenlik başlığını değerlendir
+        for header, description in SECURITY_HEADERS.items():
+            value = resp.headers.get(header)   # yoksa None döner
+            present = value is not None
+            is_critical = header in CRITICAL_HEADERS
 
-        conn.close()
+            if present:
+                status = "ok"
+            elif is_critical:
+                status = "uyarı"
+                out["warnings"].append(header)
+            else:
+                status = "eksik"
 
-    except Exception as e:
-        for header in security_headers:
-            headers_result[header] = f"HATA: {e}"
+            out["headers"][header] = {
+                "present": present,
+                "value": value,
+                "status": status,
+                "critical": is_critical,
+                "description": description,
+            }
 
-    return headers_result
+    except requests.exceptions.SSLError as e:
+        out["error"] = f"Header taraması — SSL hatası: {e}"
+    except requests.exceptions.Timeout:
+        out["error"] = f"Header taraması — {domain} zaman aşımı (10s)"
+    except requests.exceptions.ConnectionError:
+        out["error"] = f"Header taraması — {domain} bağlantı hatası"
+    except requests.exceptions.RequestException as e:
+        out["error"] = f"Header taraması — istek hatası: {e}"
+
+    return out
 
 
 # ── Terminal Çıktısı (Renkli Tablo) ──────────────────────────────
@@ -234,14 +283,31 @@ def print_report(result):
 
     # ── Güvenlik Başlıkları ──
     print(colored("\n  [ HTTP Güvenlik Başlıkları ]", Colors.BOLD))
-    for header, value in result["headers"].items():
-        if value and not value.startswith("HATA"):
-            status = colored("✓ VAR", Colors.GREEN)
-            print(f"    {status}  {header}")
-            print(f"           {colored(value, Colors.CYAN)}")
+
+    # Header taraması tamamen başarısızsa (bağlantı/SSL hatası) sebebi göster
+    if result.get("header_error"):
+        print(colored(f"    ✗ {result['header_error']}", Colors.RED))
+    else:
+        for header, info in result["headers"].items():
+            if info["present"]:
+                print(f"    {colored('✓ VAR  ', Colors.GREEN)} {header}")
+                print(f"             {colored(info['value'], Colors.CYAN)}")
+            elif info["status"] == "uyarı":
+                # Kritik başlık eksik → uyarı
+                print(f"    {colored('⚠ UYARI', Colors.YELLOW)} {header} "
+                      f"{colored('(eksik — eklenmesi önerilir)', Colors.YELLOW)}")
+            else:
+                # Kritik olmayan başlık eksik → bilgi
+                print(f"    {colored('✗ YOK  ', Colors.RED)} {header}")
+
+        # Özet: kaç kritik başlık eksik
+        warnings = result.get("header_warnings", [])
+        if warnings:
+            print(colored(
+                f"\n    ⚠ {len(warnings)} kritik güvenlik başlığı eksik: {', '.join(warnings)}",
+                Colors.YELLOW))
         else:
-            status = colored("✗ YOK", Colors.RED)
-            print(f"    {status}  {header}")
+            print(colored("\n    ✓ Tüm kritik güvenlik başlıkları mevcut", Colors.GREEN))
 
     print(colored("\n" + "=" * 60, Colors.CYAN))
     print()
@@ -261,7 +327,7 @@ def main():
     # Script'e terminalde flag'ler (--domain, --json) ile parametre geçmeni sağlar.
     # Hatalı kullanımda otomatik hata mesajı ve yardım metni gösterir.
     parser = argparse.ArgumentParser(
-        description="TLS Audit Tool v0.1 — Tek domain TLS/HTTPS güvenlik denetimi"
+        description="TLS Audit Tool v0.2 — Tek domain TLS/HTTPS güvenlik denetimi"
     )
     parser.add_argument(
         "--domain", "-d",
@@ -285,8 +351,16 @@ def main():
     result = check_tls(domain)
 
     # 2) HTTP header kontrolü (TLS bağlantısı başarılıysa)
+    #    v0.2: check_headers yapılandırılmış sonuç döndürür; ilgili alanları
+    #    mevcut JSON raporuna entegre ediyoruz. Header hatası TLS raporunu
+    #    gizlememesi için ayrı bir alanda (header_error) tutulur.
     if not result["errors"]:
-        result["headers"] = check_headers(domain)
+        header_data = check_headers(domain)
+        result["headers"]         = header_data["headers"]
+        result["header_warnings"] = header_data["warnings"]
+        result["final_url"]       = header_data["final_url"]
+        result["http_status"]     = header_data["http_status"]
+        result["header_error"]    = header_data["error"]
 
     # 3) Zaman damgası ekle
     result["scan_time"] = datetime.now(timezone.utc).isoformat()

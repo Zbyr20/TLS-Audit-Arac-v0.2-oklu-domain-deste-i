@@ -1,0 +1,3 @@
+# TLS Audit Tool v0.2 bağımlılıkları
+# HTTP güvenlik başlığı taraması (check_headers) için gereklidir.
+requests>=2.28
