@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-TLS Audit Tool v0.2
-Tek bir domain için TLS/HTTPS güvenlik denetimi yapar.
+TLS Audit Tool v0.3
+Bir veya birden fazla domain için TLS/HTTPS güvenlik denetimi yapar.
 
 Kontroller:
   - TLS versiyonu
@@ -9,6 +9,8 @@ Kontroller:
   - Sertifika bilgileri ve son kullanma tarihi
   - HTTP güvenlik başlıkları (headers) — v0.2: `requests` ile tespit,
     eksik kritik başlıklar "uyarı" olarak işaretlenir
+  - v0.3: Çoklu domain — aynı anda birden fazla site taranır (paralel),
+    sonda karşılaştırmalı özet tablo yazdırılır
 
 Gereksinim:
   pip install requests   (yalnızca header taraması için)
@@ -16,13 +18,21 @@ Gereksinim:
 Kullanım:
   python3 tls_audit.py --domain example.com
   python3 tls_audit.py --domain example.com --json rapor.json
+  python3 tls_audit.py -d example.com github.com google.com
+  python3 tls_audit.py --file domains.txt --workers 10 --json rapor.json
+
+Çıkış kodu: tüm domainler taranabildiyse 0, en az birinde hata varsa 1.
 """
 
 import ssl
 import socket
 import argparse
 import json
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+
+__version__ = "0.3"
 
 # ── Renkli terminal çıktısı ──────────────────────────────────────
 # ANSI renk kodları — terminalde renkli tablo yazdırmak için kullanılır.
@@ -182,7 +192,7 @@ def check_headers(domain, port=443):
             f"{base}/",
             timeout=10,
             allow_redirects=True,
-            headers={"User-Agent": "TLS-Audit-Tool/0.2"},
+            headers={"User-Agent": f"TLS-Audit-Tool/{__version__}"},
         )
         out["final_url"] = resp.url
         out["http_status"] = resp.status_code
@@ -321,39 +331,51 @@ def save_json(result, filepath):
     print(colored(f"  ✓ JSON rapor kaydedildi: {filepath}", Colors.GREEN))
 
 
-# ── Ana Program ──────────────────────────────────────────────────
-def main():
-    # argparse → komut satırı argümanlarını yöneten standart kütüphane modülü.
-    # Script'e terminalde flag'ler (--domain, --json) ile parametre geçmeni sağlar.
-    # Hatalı kullanımda otomatik hata mesajı ve yardım metni gösterir.
-    parser = argparse.ArgumentParser(
-        description="TLS Audit Tool v0.2 — Tek domain TLS/HTTPS güvenlik denetimi"
-    )
-    parser.add_argument(
-        "--domain", "-d",
-        type=str,
-        required=True,
-        help="Taranacak domain (ör: example.com)"
-    )
-    parser.add_argument(
-        "--json", "-j",
-        type=str,
-        default=None,
-        help="Sonuçları JSON dosyasına kaydet (ör: rapor.json)"
-    )
+# ── Çoklu Domain (v0.3) ──────────────────────────────────────────
+def normalize_domain(raw):
+    """
+    Kullanıcının yazdığı değeri çıplak domain'e çevirir.
+    "https://Example.com/path" → "example.com"
+    Boş satır veya yorum (#) ise None döner.
+    """
+    value = raw.strip()
+    if not value or value.startswith("#"):
+        return None
+    for prefix in ("https://", "http://"):
+        if value.lower().startswith(prefix):
+            value = value[len(prefix):]
+    # Yol (path) kısmını at: "example.com/login" → "example.com"
+    value = value.split("/", 1)[0]
+    return value.lower() or None
 
-    args = parser.parse_args()
-    domain = args.domain.strip().replace("https://", "").replace("http://", "").rstrip("/")
 
-    print(colored(f"\n  ⏳ {domain} taranıyor...\n", Colors.CYAN))
+def load_domains_from_file(path):
+    """
+    Her satırda bir domain olan metin dosyasını okur.
+    Boş satırlar ve # ile başlayan yorumlar atlanır; satır sonu
+    yorumları da desteklenir ("example.com  # ana site").
+    """
+    domains = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            domain = normalize_domain(line.split(" #", 1)[0])
+            if domain:
+                domains.append(domain)
+    return domains
 
+
+def unique_domains(domains):
+    """Tekrarları sırayı bozmadan temizler (dict anahtarları sırayı korur)."""
+    return list(dict.fromkeys(d for d in domains if d))
+
+
+def scan_domain(domain):
+    """Tek bir domain için TLS + header taramasını yapıp sonucu döndürür."""
     # 1) TLS kontrolü
     result = check_tls(domain)
 
     # 2) HTTP header kontrolü (TLS bağlantısı başarılıysa)
-    #    v0.2: check_headers yapılandırılmış sonuç döndürür; ilgili alanları
-    #    mevcut JSON raporuna entegre ediyoruz. Header hatası TLS raporunu
-    #    gizlememesi için ayrı bir alanda (header_error) tutulur.
+    #    Header hatası TLS raporunu gizlememesi için ayrı alanda tutulur.
     if not result["errors"]:
         header_data = check_headers(domain)
         result["headers"]         = header_data["headers"]
@@ -362,16 +384,161 @@ def main():
         result["http_status"]     = header_data["http_status"]
         result["header_error"]    = header_data["error"]
 
-    # 3) Zaman damgası ekle
+    # 3) Zaman damgası
     result["scan_time"] = datetime.now(timezone.utc).isoformat()
+    return result
 
-    # 4) Terminale yazdır
-    print_report(result)
 
-    # 5) İstenirse JSON kaydet
+def scan_domains(domains, workers=5):
+    """
+    Domainleri paralel tarar; sonuçları VERİLEN SIRAYLA döndürür.
+
+    ThreadPoolExecutor → ağ beklemesi (I/O) yoğun işlerde birden fazla
+    bağlantıyı aynı anda açmamızı sağlar. executor.map sonuçları giriş
+    sırasıyla verdiği için rapor her çalıştırmada aynı düzende çıkar.
+    """
+    workers = max(1, min(workers, len(domains)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(scan_domain, domains))
+
+
+def domain_status(result):
+    """Özet tablo için tek kelimelik durum: HATA / UYARI / İYİ."""
+    if result["errors"]:
+        return "HATA"
+    days = result.get("cert_days_left")
+    if (result.get("header_error") or result.get("header_warnings")
+            or (days is not None and days <= 30)):
+        return "UYARI"
+    return "İYİ"
+
+
+def build_summary(results):
+    """Çoklu tarama için sayısal özet (JSON raporuna da yazılır)."""
+    statuses = [domain_status(r) for r in results]
+    return {
+        "total": len(results),
+        "ok": statuses.count("İYİ"),
+        "warning": statuses.count("UYARI"),
+        "error": statuses.count("HATA"),
+    }
+
+
+def print_summary(results):
+    """Birden fazla domain tarandığında karşılaştırmalı özet tablo."""
+    status_colors = {"İYİ": Colors.GREEN, "UYARI": Colors.YELLOW, "HATA": Colors.RED}
+    width = max(len("Domain"), *(len(r["domain"]) for r in results))
+
+    print(colored("=" * 60, Colors.CYAN))
+    print(colored(f"  Özet — {len(results)} domain", Colors.BOLD))
+    print(colored("=" * 60, Colors.CYAN))
+    print(f"  {'Domain':<{width}}  {'TLS':<8} {'Gün':>5}  {'Eksik':>5}  Durum")
+    for r in results:
+        status = domain_status(r)
+        tls = (r.get("tls_version") or "-").replace("TLSv", "")
+        days = r.get("cert_days_left")
+        days_txt = str(days) if days is not None else "-"
+        missing = len(r.get("header_warnings") or []) if not r["errors"] else "-"
+        print(f"  {r['domain']:<{width}}  {tls:<8} {days_txt:>5}  {missing!s:>5}  "
+              f"{colored(status, status_colors[status])}")
+
+    summary = build_summary(results)
+    print(f"\n  {colored(str(summary['ok']) + ' iyi', Colors.GREEN)}, "
+          f"{colored(str(summary['warning']) + ' uyarı', Colors.YELLOW)}, "
+          f"{colored(str(summary['error']) + ' hata', Colors.RED)}")
+    print()
+
+
+def build_report(results):
+    """
+    JSON'a yazılacak rapor.
+    Tek domain → v0.2 ile birebir aynı biçim (geriye dönük uyumluluk).
+    Çoklu domain → özet + sonuç listesi.
+    """
+    if len(results) == 1:
+        return results[0]
+    return {
+        "tool_version": __version__,
+        "scan_time": datetime.now(timezone.utc).isoformat(),
+        "summary": build_summary(results),
+        "results": results,
+    }
+
+
+# ── Ana Program ──────────────────────────────────────────────────
+def parse_args(argv=None):
+    # argparse → komut satırı argümanlarını yöneten standart kütüphane modülü.
+    parser = argparse.ArgumentParser(
+        description=f"TLS Audit Tool v{__version__} — Çoklu domain TLS/HTTPS güvenlik denetimi"
+    )
+    parser.add_argument(
+        "--domain", "-d",
+        nargs="+",
+        default=[],
+        metavar="DOMAIN",
+        help="Taranacak domain(ler) (ör: -d example.com github.com)"
+    )
+    parser.add_argument(
+        "--file", "-f",
+        type=str,
+        default=None,
+        help="Her satırda bir domain olan dosya (# ile yorum yazılabilir)"
+    )
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=5,
+        help="Aynı anda taranacak domain sayısı (varsayılan: 5)"
+    )
+    parser.add_argument(
+        "--json", "-j",
+        type=str,
+        default=None,
+        help="Sonuçları JSON dosyasına kaydet (ör: rapor.json)"
+    )
+    parser.add_argument(
+        "--version", "-V",
+        action="version",
+        version=f"%(prog)s {__version__}"
+    )
+
+    args = parser.parse_args(argv)
+    if not args.domain and not args.file:
+        parser.error("en az bir --domain veya --file vermelisin")
+    if args.workers < 1:
+        parser.error("--workers en az 1 olmalı")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    domains = [normalize_domain(d) for d in args.domain]
+    if args.file:
+        try:
+            domains += load_domains_from_file(args.file)
+        except OSError as e:
+            print(colored(f"  ✗ Domain dosyası okunamadı: {e}", Colors.RED))
+            return 1
+    domains = unique_domains(domains)
+    if not domains:
+        print(colored("  ✗ Taranacak geçerli domain bulunamadı", Colors.RED))
+        return 1
+
+    print(colored(f"\n  ⏳ {len(domains)} domain taranıyor: {', '.join(domains)}\n", Colors.CYAN))
+
+    results = scan_domains(domains, workers=args.workers)
+
+    for result in results:
+        print_report(result)
+    if len(results) > 1:
+        print_summary(results)
+
     if args.json:
-        save_json(result, args.json)
+        save_json(build_report(results), args.json)
+
+    return 1 if any(r["errors"] for r in results) else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
