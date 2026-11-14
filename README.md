@@ -318,7 +318,7 @@ def save_json(result, filepath):
 **json.dump()** → Python sözlüğünü JSON formatına çevirip doğrudan dosyaya yazar.
 
 - `indent=2` → JSON'u düzgün girintili (okunabilir) yazar. Bu olmadan her şey tek satırda olur.
-- `ensure_ascii=False` → Türkçe karakterlerin (ö, ü, ş, ç) düzgün yazılmasını sağlar. Bu olmadan `ö` gibi kodlarla yazar.
+- `ensure_ascii=False` → Türkçe karakterlerin (ö, ü, ş, ç) düzgün yazılmasını sağlar. Bu olmadan ö gibi harfler Unicode kaçış koduyla (ters eğik çizgi + `u00f6`) yazılır.
 
 JSON çıktısını Fiverr'daki müşterine rapor olarak verebilirsin — veya başka araçlarla (Splunk, ELK, Grafana) işleyebilirsin.
 
