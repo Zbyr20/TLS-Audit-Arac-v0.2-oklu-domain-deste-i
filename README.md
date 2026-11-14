@@ -1,9 +1,58 @@
-# TLS-Audit-Arac-v0.2-oklu-domain-deste-i
-Bir çok sitenin TLS auidtini ve headerlarını aynı anda kontrol eden python kodu. Claude ile çalışıldı.
+# TLS Audit Tool
 
-# TLS Audit Tool v0.1 — Kod Açıklaması
+Birçok sitenin TLS yapılandırmasını ve HTTP güvenlik başlıklarını aynı anda denetleyen Python aracı. Claude ile birlikte geliştirildi.
 
-Bu belge, `tls_audit.py` dosyasındaki her parçanın ne yaptığını sade bir dille anlatır.
+## Hızlı Başlangıç
+
+Gereksinim: Python 3.9+
+
+```bash
+git clone https://github.com/Zbyr20/TLS-Audit-Arac-v0.2-oklu-domain-deste-i.git
+cd TLS-Audit-Arac-v0.2-oklu-domain-deste-i
+python -m venv .venv
+# Windows: .venv\Scripts\activate   |   Linux/macOS: source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+```bash
+# Tek domain
+python tls_audit.py -d example.com
+
+# Birden fazla domain — paralel taranır, sonda özet tablo çıkar
+python tls_audit.py -d example.com github.com google.com
+
+# Dosyadan oku (her satıra bir domain, # ile yorum) + JSON rapor
+python tls_audit.py -f domains.example.txt -w 10 -j rapor.json
+```
+
+| Seçenek | Açıklama |
+|---------|----------|
+| `-d, --domain` | Bir veya daha fazla domain (`https://` ve yol kısmı otomatik temizlenir) |
+| `-f, --file` | Domain listesi dosyası; boş satırlar ve `#` yorumları atlanır |
+| `-w, --workers` | Aynı anda taranacak domain sayısı (varsayılan 5) |
+| `-j, --json` | JSON rapor. Tek domainde v0.2 biçimi; çoklu taramada `summary` + `results` |
+| `-V, --version` | Sürümü gösterir |
+
+Özet tablodaki durumlar: **İYİ** (sorun yok), **UYARI** (kritik başlık eksik, başlık taraması başarısız ya da sertifikanın bitmesine ≤30 gün), **HATA** (TLS bağlantısı kurulamadı). Herhangi bir domain HATA verirse program `1` çıkış koduyla biter — CI veya zamanlanmış görevlerde kullanılabilir.
+
+### Testler
+
+Testler ağ bağlantısı gerektirmez:
+
+```bash
+pip install pytest
+python -m pytest -q
+```
+
+Sürüm geçmişi için [CHANGELOG.md](CHANGELOG.md) dosyasına bakın.
+
+> ⚠️ Yalnızca sahibi olduğunuz ya da test izniniz bulunan sistemleri tarayın.
+
+---
+
+# Kod Açıklaması (v0.1 temelleri)
+
+Bu bölüm, `tls_audit.py` dosyasının temel parçalarının ne yaptığını sade bir dille anlatır. Kod örnekleri v0.1'in çekirdeğini gösterir; v0.2'de başlık taraması `requests`'e, v0.3'te çoklu domain ve paralel taramaya geçildi (ayrıntılar CHANGELOG'da).
 
 ---
 
@@ -221,6 +270,8 @@ Bu fonksiyon siteye bir HTTP isteği gönderip yanıttaki güvenlik başlıklar�
 
 **http.client** → Python'un dahili HTTP istemcisi. `requests` kütüphanesi daha popüler ama kurulum gerektirir; `http.client` kurulum gerektirmez.
 
+> **Not:** v0.2'den itibaren bu fonksiyon `requests` kütüphanesini kullanır ve HEAD yerine yönlendirmeleri takip eden bir GET isteği gönderir; böylece son sayfanın başlıkları okunur ve eksik kritik başlıklar "uyarı" olarak işaretlenir. Bu yüzden `pip install -r requirements.txt` gerekir.
+
 **HEAD isteği nedir?** Normal bir GET isteği sayfanın tüm içeriğini (HTML, resimler vs.) indirir. HEAD ise sadece başlıkları (headers) getirir, içeriği indirmez. Biz sadece başlıklara bakacağımız için HEAD kullanıyoruz — daha hızlı ve daha az bant genişliği harcar.
 
 **Kontrol edilen güvenlik başlıkları:**
@@ -267,7 +318,7 @@ def save_json(result, filepath):
 **json.dump()** → Python sözlüğünü JSON formatına çevirip doğrudan dosyaya yazar.
 
 - `indent=2` → JSON'u düzgün girintili (okunabilir) yazar. Bu olmadan her şey tek satırda olur.
-- `ensure_ascii=False` → Türkçe karakterlerin (ö, ü, ş, ç) düzgün yazılmasını sağlar. Bu olmadan `\u00f6` gibi kodlarla yazar.
+- `ensure_ascii=False` → Türkçe karakterlerin (ö, ü, ş, ç) düzgün yazılmasını sağlar. Bu olmadan `ö` gibi kodlarla yazar.
 
 JSON çıktısını Fiverr'daki müşterine rapor olarak verebilirsin — veya başka araçlarla (Splunk, ELK, Grafana) işleyebilirsin.
 
