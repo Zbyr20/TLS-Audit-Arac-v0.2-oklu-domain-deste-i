@@ -1,0 +1,4 @@
+# Her satıra bir domain yaz. # ile başlayan satırlar yorumdur.
+example.com
+github.com
+google.com   # satır sonu yorumu da olur
